@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { supabase, ARROW_TABLE } from "./supabase";
 
 /* ── Generic tax helpers ── */
 function bTx(income,brackets){let t=0,r=income;for(const[w,rt]of brackets){t+=Math.min(r,w)*rt;r-=w;if(r<=0)break}return t}
@@ -2455,7 +2456,35 @@ export default function App(){
     {from:"g-tax",to:"tax-Tax",color:TC},
     ...tax.components.map((c,i)=>({from:"tx-"+i,to:"def-"+i,color:c.color})),
     ...cats.map(c=>({from:"eq2-"+c.key,to:"d-"+c.key,color:c.color})),
-  ];
+  ].map(c=>({...c,id:c.from+"->"+c.to}));
+
+  // Manual arrow tweaks: { [connId]: {dx, dy} } — midpoint offset in px.
+  const[offsets,setOffsets]=useState({});
+  const offsetsRef=useRef(offsets);
+  useEffect(()=>{offsetsRef.current=offsets},[offsets]);
+
+  // Load saved offsets from Supabase once.
+  useEffect(()=>{
+    if(!supabase)return;
+    let cancelled=false;
+    (async()=>{
+      const{data,error}=await supabase.from(ARROW_TABLE).select("conn_id,dx,dy");
+      if(cancelled)return;
+      if(error){console.warn("[supabase] load offsets failed",error);return}
+      const m={};(data||[]).forEach(r=>{m[r.conn_id]={dx:r.dx||0,dy:r.dy||0}});
+      setOffsets(m);
+    })();
+    return()=>{cancelled=true};
+  },[]);
+
+  const saveOffset=async(connId,dx,dy)=>{
+    if(!supabase)return;
+    const{error}=await supabase.from(ARROW_TABLE).upsert(
+      {conn_id:connId,dx,dy,updated_at:new Date().toISOString()},
+      {onConflict:"conn_id"}
+    );
+    if(error)console.warn("[supabase] save offset failed",error);
+  };
 
   const cRef=useRef(null),svgRef=useRef(null);
   useEffect(()=>{
@@ -2466,17 +2495,72 @@ export default function App(){
       while(svg.firstChild)svg.removeChild(svg.firstChild);
       const cr=cont.getBoundingClientRect();
       const pos=id=>{const el=cont.querySelector('[data-var="'+id+'"]');if(!el)return null;const r=el.getBoundingClientRect();return{cx:r.left-cr.left+r.width/2,top:r.top-cr.top,bot:r.bottom-cr.top}};
+      const NS="http://www.w3.org/2000/svg";
       conns.forEach(conn=>{
-        const s=pos(conn.from),t=pos(conn.to);if(!s||!t)return;
-        const x1=s.cx,y1=s.bot+1,x2=t.cx,y2=t.top-1,dy=y2-y1;if(dy<6)return;
+        const sP=pos(conn.from),tP=pos(conn.to);if(!sP||!tP)return;
+        const x1=sP.cx,y1=sP.bot+1,x2=tP.cx,y2=tP.top-1,dy=y2-y1;if(dy<6)return;
         const cp=Math.min(Math.max(18,dy*0.4),120);
-        const path=document.createElementNS("http://www.w3.org/2000/svg","path");
-        path.setAttribute("d","M"+x1+","+y1+" C"+x1+","+(y1+cp)+" "+x2+","+(y2-cp)+" "+x2+","+y2);
+        const off=offsetsRef.current[conn.id]||{dx:0,dy:0};
+        // Shift both control points so the curve midpoint moves by (off.dx, off.dy).
+        // For cubic with P0=(x1,y1), P1=(x1,y1+cp), P2=(x2,y2-cp), P3=(x2,y2),
+        // mid B(0.5) shifts by (3/4)*controlShift, so controlShift = (4/3)*offset.
+        const ax=off.dx*4/3, ay=off.dy*4/3;
+        const c1x=x1+ax, c1y=y1+cp+ay, c2x=x2+ax, c2y=y2-cp+ay;
+        const path=document.createElementNS(NS,"path");
+        path.setAttribute("d","M"+x1+","+y1+" C"+c1x+","+c1y+" "+c2x+","+c2y+" "+x2+","+y2);
         path.setAttribute("stroke",conn.color);path.setAttribute("stroke-width","1.5");
-        path.setAttribute("fill","none");path.setAttribute("opacity","0.38");svg.appendChild(path);
-        const a=4.5;const tri=document.createElementNS("http://www.w3.org/2000/svg","polygon");
+        path.setAttribute("fill","none");path.setAttribute("opacity","0.38");
+        path.style.pointerEvents="none";
+        svg.appendChild(path);
+        const a=4.5;const tri=document.createElementNS(NS,"polygon");
         tri.setAttribute("points",x2+","+y2+" "+(x2-a)+","+(y2-a*1.7)+" "+(x2+a)+","+(y2-a*1.7));
-        tri.setAttribute("fill",conn.color);tri.setAttribute("opacity","0.45");svg.appendChild(tri);
+        tri.setAttribute("fill",conn.color);tri.setAttribute("opacity","0.45");
+        tri.style.pointerEvents="none";
+        svg.appendChild(tri);
+
+        // Draggable midpoint handle.
+        const mx=(x1+x2)/2+off.dx, my=(y1+y2)/2+off.dy;
+        const hit=document.createElementNS(NS,"circle");
+        hit.setAttribute("cx",mx);hit.setAttribute("cy",my);hit.setAttribute("r","14");
+        hit.setAttribute("fill","transparent");
+        hit.style.cursor="grab";hit.style.pointerEvents="all";hit.style.touchAction="none";
+        const dot=document.createElementNS(NS,"circle");
+        dot.setAttribute("cx",mx);dot.setAttribute("cy",my);dot.setAttribute("r","4");
+        dot.setAttribute("fill",conn.color);
+        dot.setAttribute("opacity","0.35");
+        dot.setAttribute("stroke","#fff");dot.setAttribute("stroke-width","1");
+        dot.style.pointerEvents="none";
+        const onDown=(e)=>{
+          e.preventDefault();e.stopPropagation();
+          hit.setPointerCapture&&hit.setPointerCapture(e.pointerId);
+          const sx=e.clientX,sy=e.clientY;
+          const start=offsetsRef.current[conn.id]||{dx:0,dy:0};
+          dot.setAttribute("opacity","0.9");hit.style.cursor="grabbing";
+          const onMove=(ev)=>{
+            const ndx=start.dx+(ev.clientX-sx);
+            const ndy=start.dy+(ev.clientY-sy);
+            setOffsets(p=>({...p,[conn.id]:{dx:ndx,dy:ndy}}));
+          };
+          const onUp=(ev)=>{
+            window.removeEventListener("pointermove",onMove);
+            window.removeEventListener("pointerup",onUp);
+            window.removeEventListener("pointercancel",onUp);
+            const final=offsetsRef.current[conn.id]||{dx:0,dy:0};
+            saveOffset(conn.id,final.dx,final.dy);
+          };
+          window.addEventListener("pointermove",onMove);
+          window.addEventListener("pointerup",onUp);
+          window.addEventListener("pointercancel",onUp);
+        };
+        hit.addEventListener("pointerdown",onDown);
+        // Double-click to reset this arrow.
+        hit.addEventListener("dblclick",(e)=>{
+          e.preventDefault();e.stopPropagation();
+          setOffsets(p=>{const n={...p};delete n[conn.id];return n});
+          saveOffset(conn.id,0,0);
+        });
+        svg.appendChild(hit);
+        svg.appendChild(dot);
       });
     };
     const raf=()=>requestAnimationFrame(draw);
