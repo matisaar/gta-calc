@@ -2465,19 +2465,51 @@ export default function App(){
 
   const sRef=useRef(s);useEffect(()=>{sRef.current=s},[s]);
   const saveTimer=useRef(null);
+  const doSaveBudget=async(state)=>{
+    if(!supabase)return;
+    const{error}=await supabase.from(BUDGET_TABLE).upsert(
+      {ckey,fam,state,updated_at:new Date().toISOString()},
+      {onConflict:"ckey,fam"}
+    );
+    if(error)console.warn("[supabase] save budget failed",error);
+  };
   useEffect(()=>{
     if(!supabase)return;
     if(loadedKey!==(ckey+"|"+fam))return;
     if(saveTimer.current)clearTimeout(saveTimer.current);
-    saveTimer.current=setTimeout(async()=>{
-      const{error}=await supabase.from(BUDGET_TABLE).upsert(
-        {ckey,fam,state:sRef.current,updated_at:new Date().toISOString()},
-        {onConflict:"ckey,fam"}
-      );
-      if(error)console.warn("[supabase] save budget failed",error);
-    },400);
+    saveTimer.current=setTimeout(()=>doSaveBudget(sRef.current),150);
     return()=>{if(saveTimer.current)clearTimeout(saveTimer.current)};
   },[s,ckey,fam,loadedKey]);
+
+  // Flush any pending save before the page unloads (covers fast reloads).
+  useEffect(()=>{
+    const url=import.meta.env.VITE_SUPABASE_URL;
+    const key=import.meta.env.VITE_SUPABASE_ANON_KEY;
+    if(!url||!key)return;
+    const flush=()=>{
+      if(loadedKey!==(ckey+"|"+fam))return;
+      if(saveTimer.current){clearTimeout(saveTimer.current);saveTimer.current=null}
+      try{
+        const body=JSON.stringify({ckey,fam,state:sRef.current,updated_at:new Date().toISOString()});
+        const endpoint=url+"/rest/v1/"+BUDGET_TABLE+"?on_conflict=ckey,fam";
+        // sendBeacon can't set custom headers; use fetch keepalive instead.
+        fetch(endpoint,{
+          method:"POST",keepalive:true,
+          headers:{"Content-Type":"application/json","apikey":key,"Authorization":"Bearer "+key,"Prefer":"resolution=merge-duplicates,return=minimal"},
+          body
+        }).catch(()=>{});
+      }catch(_){}
+    };
+    const onVis=()=>{if(document.visibilityState==="hidden")flush()};
+    window.addEventListener("pagehide",flush);
+    window.addEventListener("beforeunload",flush);
+    document.addEventListener("visibilitychange",onVis);
+    return()=>{
+      window.removeEventListener("pagehide",flush);
+      window.removeEventListener("beforeunload",flush);
+      document.removeEventListener("visibilitychange",onVis);
+    };
+  },[ckey,fam,loadedKey]);
 
   const tots={};
   cats.forEach(c=>{tots[c.key]=c.items.reduce((a,i)=>a+(s[i.k]||0),0)*12});
