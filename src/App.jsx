@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { supabase, ARROW_TABLE } from "./supabase";
+import { supabase, ARROW_TABLE, BUDGET_TABLE } from "./supabase";
 
 /* ── Generic tax helpers ── */
 function bTx(income,brackets){let t=0,r=income;for(const[w,rt]of brackets){t+=Math.min(r,w)*rt;r-=w;if(r<=0)break}return t}
@@ -2442,6 +2442,42 @@ export default function App(){
   const up=(k,v)=>setS(p=>({...p,[k]:v}));
   const switchCountry=(k)=>{setCkey(k);const base=mkInit(COUNTRIES[k].cats);setS(p=>{const o={...base};if(fam){const fi=mkFamInit();Object.assign(o,fi)}return o})};
   const toggleFam=()=>{setFam(f=>{const next=!f;setS(p=>{const o={...p};if(next){const fi=mkFamInit();Object.keys(fi).forEach(k=>{if(!(k in o)||o[k]===0)o[k]=fi[k]});} else {const fz=mkFamZero();Object.assign(o,fz);}return o});return next})};
+
+  // Persist budget numbers to Supabase, keyed by (ckey, fam).
+  // loadedKey gates writes so we don't clobber stored values with defaults.
+  const[loadedKey,setLoadedKey]=useState(null);
+  useEffect(()=>{
+    if(!supabase){setLoadedKey(ckey+"|"+fam);return}
+    let cancelled=false;
+    setLoadedKey(null);
+    (async()=>{
+      const{data,error}=await supabase.from(BUDGET_TABLE)
+        .select("state").eq("ckey",ckey).eq("fam",fam).maybeSingle();
+      if(cancelled)return;
+      if(error){console.warn("[supabase] load budget failed",error);setLoadedKey(ckey+"|"+fam);return}
+      if(data&&data.state&&typeof data.state==="object"){
+        setS(prev=>({...prev,...data.state}));
+      }
+      setLoadedKey(ckey+"|"+fam);
+    })();
+    return()=>{cancelled=true};
+  },[ckey,fam]);
+
+  const sRef=useRef(s);useEffect(()=>{sRef.current=s},[s]);
+  const saveTimer=useRef(null);
+  useEffect(()=>{
+    if(!supabase)return;
+    if(loadedKey!==(ckey+"|"+fam))return;
+    if(saveTimer.current)clearTimeout(saveTimer.current);
+    saveTimer.current=setTimeout(async()=>{
+      const{error}=await supabase.from(BUDGET_TABLE).upsert(
+        {ckey,fam,state:sRef.current,updated_at:new Date().toISOString()},
+        {onConflict:"ckey,fam"}
+      );
+      if(error)console.warn("[supabase] save budget failed",error);
+    },400);
+    return()=>{if(saveTimer.current)clearTimeout(saveTimer.current)};
+  },[s,ckey,fam,loadedKey]);
 
   const tots={};
   cats.forEach(c=>{tots[c.key]=c.items.reduce((a,i)=>a+(s[i.k]||0),0)*12});
